@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import asyncio
-import uuid
-from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .downloader import run_download
 from .quality import extract_variants, select_variant
-from .security import extract_and_validate_douyin_url, require_api_key
+from .security import extract_and_validate_douyin_url, verify_compat_token
 from .settings import settings
-from .store import create_task, get_task, init_db, list_tasks
 from .upstream import kernel
 
 
@@ -19,90 +16,178 @@ class ParseRequest(BaseModel):
     url: str = Field(..., description="Douyin URL or share text containing a Douyin URL")
     quality: str = "best"
     codec: str = "auto"
-
-
-class DownloadRequest(ParseRequest):
-    pass
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    settings.download_dir.mkdir(parents=True, exist_ok=True)
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    await init_db()
-    yield
+    token: str | None = None
 
 
 app = FastAPI(
-    title="Douyin NAS",
-    version="0.1.0",
-    description="fnOS-oriented Douyin best-quality parser and background downloader",
+    title="Douyin Original Parser",
+    version="0.2.0",
+    description="Parser-only Douyin API for fnOS and DYYY; returns direct media URLs and never stores media files.",
     docs_url="/docs" if settings.docs_enabled else None,
     redoc_url=None,
-    lifespan=lifespan,
 )
 
 
+def _first_http_url(value: Any) -> str | None:
+    if isinstance(value, str) and value.startswith("http"):
+        return value
+    if isinstance(value, dict):
+        for key in ("url_list", "download_url_list"):
+            urls = value.get(key)
+            if isinstance(urls, list):
+                for item in urls:
+                    if isinstance(item, str) and item.startswith("http"):
+                        return item
+    return None
+
+
+def _cover_url(detail: dict[str, Any]) -> str | None:
+    video = detail.get("video") or {}
+    for key in ("origin_cover", "cover", "dynamic_cover"):
+        url = _first_http_url(video.get(key))
+        if url:
+            return url
+    return None
+
+
+def _music_url(detail: dict[str, Any]) -> str | None:
+    music = detail.get("music") or {}
+    for key in ("play_url", "play_url_uri"):
+        url = _first_http_url(music.get(key))
+        if url:
+            return url
+    return None
+
+
+def _image_urls(detail: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for image in detail.get("images") or []:
+        url = _first_http_url(image)
+        if not url and isinstance(image, dict):
+            for key in ("url", "display_image", "download_url"):
+                url = _first_http_url(image.get(key))
+                if url:
+                    break
+        if url and url not in seen:
+            seen.add(url)
+            result.append(url)
+    return result
+
+
+def _level(v: Any) -> str:
+    bits = [v.label]
+    if v.codec and v.codec != "unknown":
+        bits.append(v.codec.upper())
+    if v.bitrate:
+        bits.append(f"{v.bitrate / 1_000_000:.1f}Mbps")
+    return " / ".join(bits)
+
+
+async def _parse_payload(raw_url: str, quality: str, codec: str) -> dict[str, Any]:
+    url = extract_and_validate_douyin_url(raw_url)
+    aweme_id, detail = await kernel.parse(url)
+
+    common: dict[str, Any] = {
+        "aweme_id": aweme_id,
+        "desc": detail.get("desc") or "",
+        "cover": _cover_url(detail),
+        "music": _music_url(detail),
+    }
+
+    images = _image_urls(detail)
+    if detail.get("aweme_type") in {2, 68} or images:
+        common["images"] = images
+        common["type"] = "image"
+        return common
+
+    variants = extract_variants(detail)
+    selected = select_variant(variants, quality or settings.default_quality, codec or settings.default_codec)
+
+    video_list = [
+        {
+            "url": v.url,
+            "level": _level(v),
+            "quality": v.label,
+            "codec": v.codec,
+            "width": v.width,
+            "height": v.height,
+            "bitrate": v.bitrate,
+            "data_size": v.data_size,
+        }
+        for v in variants
+    ]
+
+    common.update(
+        {
+            "type": "video",
+            "video_url": selected.url,
+            "video": selected.url,
+            "url": selected.url,
+            "video_list": video_list,
+            "selected_quality": selected.label,
+            "selected_codec": selected.codec,
+            "width": selected.width,
+            "height": selected.height,
+            "bitrate": selected.bitrate,
+            "data_size": selected.data_size,
+        }
+    )
+    return common
+
+
+def _compat_error(code: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=200, content={"code": code, "msg": message, "data": {}})
+
+
+@app.get("/")
+async def root() -> dict[str, Any]:
+    return {
+        "name": "Douyin Original Parser",
+        "version": "0.2.0",
+        "mode": "parser-only",
+        "dyyy_endpoint": "/dy.php?url=",
+        "token_supported": True,
+    }
+
+
 @app.get("/health")
-async def health() -> dict:
+async def health() -> dict[str, Any]:
     return {
         "ok": True,
+        "mode": "parser-only",
         "cookie_configured": bool(settings.douyin_cookie),
-        "api_key_configured": bool(settings.api_key),
-        "download_dir": str(settings.download_dir),
+        "compat_token_configured": bool(settings.compat_token),
+        "default_quality": settings.default_quality,
+        "default_codec": settings.default_codec,
     }
 
 
-@app.post("/api/v1/parse", dependencies=[Depends(require_api_key)])
-async def parse_video(body: ParseRequest) -> dict:
-    url = extract_and_validate_douyin_url(body.url)
-    aweme_id, detail = await kernel.parse(url)
-    if detail.get("aweme_type") in {2, 68} or detail.get("images"):
-        return {
-            "aweme_id": aweme_id,
-            "type": "image",
-            "message": "Image post detected; video quality selection does not apply",
-        }
-    variants = extract_variants(detail)
+@app.get("/dy.php")
+async def dyyy_compat(
+    url: str | None = Query(default=None, description="Douyin share URL"),
+    token: str | None = Query(default=None),
+    quality: str = Query(default="best"),
+    codec: str = Query(default="auto"),
+):
+    """DYYY-compatible GET endpoint, e.g. /dy.php?url=https://v.douyin.com/..."""
     try:
-        selected = select_variant(variants, body.quality, body.codec)
+        verify_compat_token(token)
+        if not url:
+            return _compat_error(400, "缺少 url 参数")
+        data = await _parse_payload(url, quality, codec)
+        return {"code": 200, "msg": "success", "data": data}
+    except HTTPException as exc:
+        return _compat_error(exc.status_code, str(exc.detail))
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {
-        "aweme_id": aweme_id,
-        "type": "video",
-        "desc": detail.get("desc"),
-        "author": detail.get("author"),
-        "create_time": detail.get("create_time"),
-        "selected": selected.public(),
-        "variants": [v.public() for v in variants],
-    }
+        return _compat_error(502, str(exc))
+    except Exception as exc:
+        return _compat_error(500, f"解析失败: {exc}")
 
 
-@app.post("/api/v1/downloads", status_code=202, dependencies=[Depends(require_api_key)])
-async def enqueue_download(body: DownloadRequest) -> dict:
-    url = extract_and_validate_douyin_url(body.url)
-    quality = (body.quality or settings.default_quality).lower()
-    codec = (body.codec or settings.default_codec).lower()
-    if codec not in {"auto", "h264", "h265"}:
-        raise HTTPException(status_code=400, detail="codec must be auto, h264, or h265")
-    task_id = uuid.uuid4().hex
-    await create_task(task_id, url, quality, codec)
-    asyncio.create_task(run_download(task_id, url, quality, codec))
-    return {"task_id": task_id, "status": "queued"}
-
-
-@app.get("/api/v1/downloads", dependencies=[Depends(require_api_key)])
-async def downloads(limit: int = Query(default=50, ge=1, le=200)) -> dict:
-    return {"items": await list_tasks(limit)}
-
-
-@app.get("/api/v1/downloads/{task_id}", dependencies=[Depends(require_api_key)])
-async def download_status(task_id: str) -> dict:
-    task = await get_task(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    total = task.get("bytes_total") or 0
-    done = task.get("bytes_done") or 0
-    task["progress"] = round(done * 100 / total, 2) if total else None
-    return task
+@app.post("/api/v1/parse")
+async def parse_api(body: ParseRequest) -> dict[str, Any]:
+    """Debug/automation endpoint. Unlike /dy.php, HTTP errors are preserved."""
+    verify_compat_token(body.token)
+    data = await _parse_payload(body.url, body.quality, body.codec)
+    return {"code": 200, "msg": "success", "data": data}
