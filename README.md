@@ -1,84 +1,108 @@
-# Douyin NAS for fnOS
+# Douyin Original Parser for fnOS + DYYY
 
-A small NAS-oriented service that uses the proven Douyin parsing/signature engine from [Evil0ctal/Douyin_TikTok_Download_API](https://github.com/Evil0ctal/Douyin_TikTok_Download_API), then replaces the deployment/download layer with a safer fnOS-focused implementation.
+这是一个面向飞牛 fnOS x86 NAS 的**纯解析服务**。NAS 只负责解析抖音分享链接并返回抖音 CDN 的直接媒体 URL，不代理、不转码、不保存视频文件。
 
-## What this fork-layer changes
+核心用途是给 DYYY 提供如下形式的解析接口：
 
-- x86_64 fnOS/Docker deployment with bridge networking; no host network and no privileged container.
-- Strict Douyin-domain input validation and `X-API-Key` authentication.
-- Enumerates `video.bit_rate` candidates instead of assuming `play_addr.url_list[0]` is the highest quality.
-- Chooses `best`, or a requested `2160p` / `1440p` / `1080p` / etc. quality, with optional `h264` / `h265` preference.
-- Downloads directly from the Douyin CDN to the NAS in a background task.
-- Persistent task metadata in SQLite under `/data`.
-- Configurable concurrency, maximum file size, and minimum free disk space.
-- Cookie is supplied through `.env`; it is not committed to Git.
+```text
+https://你的域名/dy.php?url=
+```
 
-> "Best" means the highest-quality media variant returned by Douyin for the current account, IP, request profile and video. It cannot restore an author's pre-upload master if Douyin does not expose it.
+公网部署建议使用：
 
-## Quick start
+```text
+https://你的域名/dy.php?token=你的密钥&url=
+```
+
+DYYY 会把分享链接 URL 编码后直接追加到这个接口前缀。
+
+## DYYY 兼容返回
+
+成功时：
+
+```json
+{
+  "code": 200,
+  "msg": "success",
+  "data": {
+    "video_url": "https://...douyin-cdn.../video.mp4",
+    "video": "https://...douyin-cdn.../video.mp4",
+    "url": "https://...douyin-cdn.../video.mp4",
+    "video_list": [
+      {
+        "url": "https://...",
+        "level": "2160p / H265 / 12.0Mbps"
+      }
+    ],
+    "cover": "https://...",
+    "music": "https://..."
+  }
+}
+```
+
+`video_url` 默认指向抖音当前返回候选中分辨率最高、随后码率最高的源。`video_list` 保留全部候选，供 DYYY 的“接口显示清晰选项”使用。
+
+## 架构
+
+```text
+DYYY / iPhone
+    |
+    | GET https://domain/dy.php?url=<share-link>
+    v
+fnOS Docker: douyin-parser
+    |
+    | 只请求作品元数据
+    v
+Douyin Web API
+    |
+    | 返回 bit_rate / play_addr
+    v
+最高画质选择器
+    |
+    | JSON 返回直接 CDN URL
+    v
+DYYY 直接从抖音 CDN 下载
+```
+
+NAS 本身不会承载视频下载流量，也不需要视频下载目录。
+
+## 快速部署
+
+完整教程见 [DEPLOY_FNOS_DYYY.md](./DEPLOY_FNOS_DYYY.md)。
 
 ```bash
-git clone https://github.com/Rok1n/Quickstart-MahoganySquad-master.git douyin-nas
-cd douyin-nas
+git clone https://github.com/Rok1n/Quickstart-MahoganySquad-master.git douyin-parser
+cd douyin-parser
 cp .env.example .env
 nano .env
-mkdir -p /your/download/path /your/data/path
 docker compose up -d --build
 ```
 
-Open `http://NAS-IP:18080/health`. API docs are at `http://NAS-IP:18080/docs` when `DOCS_ENABLED=true`.
-
-All `/api/v1/*` requests require:
+健康检查：
 
 ```text
-X-API-Key: <API_KEY from .env>
+http://NAS-IP:18080/health
 ```
 
-### Parse and inspect all returned qualities
+本地接口测试：
 
 ```bash
-curl -X POST 'http://NAS-IP:18080/api/v1/parse' \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: YOUR_KEY' \
-  -d '{"url":"https://v.douyin.com/xxxx/","quality":"best","codec":"auto"}'
+curl -G 'http://NAS-IP:18080/dy.php' \
+  --data-urlencode 'url=https://v.douyin.com/你的短链/'
 ```
 
-### Create a NAS download task
+## 原画选择规则
 
-```bash
-curl -X POST 'http://NAS-IP:18080/api/v1/downloads' \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: YOUR_KEY' \
-  -d '{"url":"https://v.douyin.com/xxxx/","quality":"best","codec":"auto"}'
-```
+服务优先读取抖音作品详情中的 `video.bit_rate[]`，遍历各候选的 `play_addr`，再按以下顺序选择：
 
-Then query:
+1. 像素数量（宽 × 高）
+2. 码率
+3. 数据大小
 
-```bash
-curl -H 'X-API-Key: YOUR_KEY' \
-  'http://NAS-IP:18080/api/v1/downloads/TASK_ID'
-```
+因此 `best` 的准确含义是：**抖音当前向该 Cookie、IP 和请求环境暴露的最高可得源流**。它不等同于作者上传前的母版；如果抖音本次只返回 1080p，服务无法凭空生成 2K/4K。
 
-Completed files are organized as:
+## 安全
 
-```text
-/downloads/<author>/<YYYY-MM-DD>/<description>_<aweme_id>_<quality>_<codec>.mp4
-```
+输入仅接受 `douyin.com`、`v.douyin.com` 和 `iesdouyin.com` 域名。公网部署强烈建议设置 `COMPAT_TOKEN`，并使用 HTTPS。
 
-## fnOS permissions
-
-The compose file runs the container as `${PUID}:${PGID}`. On fnOS, SSH into the NAS and determine your UID/GID with `id`. Ensure both host directories in `.env` are writable by that account.
-
-## Cookie
-
-Douyin may return no detail or lower-quality variants when requests are unauthenticated or risk-controlled. Set `DOUYIN_COOKIE` to the Cookie request header from a logged-in `douyin.com` browser session. Do not commit `.env`.
-
-## Security
-
-Do not expose port 18080 directly to the public Internet. For remote use, place it behind your own authenticated reverse proxy or VPN/Tailscale-equivalent layer. The built-in API key is a second line of defense, not a complete Internet perimeter.
-
-## Upstream dependency
-
-The Dockerfile pins the upstream parser/signature engine using `UPSTREAM_REF`. This project intentionally does not duplicate its `a_bogus` implementation. When Douyin changes request signing, update `UPSTREAM_REF`, rebuild, and test `/api/v1/parse` before changing the NAS service layer.
-
-Upstream project: Evil0ctal/Douyin_TikTok_Download_API, Apache-2.0 licensed.
+本项目的抖音请求内核基于 `Evil0ctal/Douyin_TikTok_Download_API`，Docker 构建时固定上游 commit，避免构建结果随上游变化而不可复现。
