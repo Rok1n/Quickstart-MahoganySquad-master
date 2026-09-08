@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hmac
 import re
 from urllib.parse import urlparse
 
-from fastapi import Header, HTTPException, status
+from fastapi import HTTPException, status
 
 from .settings import settings
 
@@ -17,16 +18,12 @@ ALLOWED_HOSTS = {
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
-def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    if not settings.api_key:
-        if settings.allow_insecure_no_api_key:
-            return
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="API_KEY is not configured",
-        )
-    if x_api_key != settings.api_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+def verify_compat_token(token: str | None) -> None:
+    """If COMPAT_TOKEN is blank the endpoint is public; otherwise a matching query token is required."""
+    if not settings.compat_token:
+        return
+    if not token or not hmac.compare_digest(token, settings.compat_token):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
 def extract_and_validate_douyin_url(text: str) -> str:
