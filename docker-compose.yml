@@ -1,0 +1,33 @@
+services:
+  douyin-nas:
+    build:
+      context: .
+      args:
+        UPSTREAM_REF: ${UPSTREAM_REF:-42784ffc83a72a516bfe952153ad7e2a3998d16c}
+    image: douyin-nas:local
+    container_name: douyin-nas
+    restart: unless-stopped
+    ports:
+      - "${PORT:-18080}:8080"
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      DOWNLOAD_DIR: /downloads
+      DATA_DIR: /data
+    user: "${PUID:-1000}:${PGID:-1000}"
+    volumes:
+      - ${DOWNLOAD_HOST_PATH}:/downloads
+      - ${DATA_HOST_PATH}:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
